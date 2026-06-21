@@ -1,0 +1,172 @@
+name: Talise
+options:
+  bundleIdPrefix: io.talise
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Signing — automatic, tied to the developer's Team. Xcode generates the
+    # distribution cert + provisioning profiles on Archive → Distribute when
+    # signed in with this Team (requires an active Apple Developer Program
+    # membership). Both the app + the NSE inherit this.
+    DEVELOPMENT_TEAM: 5N8DU2A9WH
+    CODE_SIGN_STYLE: Automatic
+
+# SPM deps:
+# - SuiGrpcKit: local Swift package that owns the Sui gRPC client,
+#   the multi-endpoint fallback registry, and the generated .pb.swift
+#   bindings. Transitively pulls in grpc-swift v2 + swift-protobuf.
+#   See ios/SuiGrpcKit/README.md for the package layout and
+#   ios/SuiGrpcKit/Scripts/regen-proto.sh for regenerating bindings.
+# - Google sign-in uses ASWebAuthenticationSession (Apple SDK) against
+#   our backend's /api/auth/mobile/start.
+packages:
+  SuiGrpcKit:
+    path: ./SuiGrpcKit
+
+targets:
+  Talise:
+    type: application
+    platform: iOS
+    sources:
+      - path: Talise
+        excludes:
+          - "**/.DS_Store"
+    resources:
+      - Talise/Resources/Assets.xcassets
+      - Talise/Resources/GoogleSans
+    info:
+      path: Talise/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Talise
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        # iPhone-only (TARGETED_DEVICE_FAMILY 1), portrait-only.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        CFBundleURLTypes:
+          - CFBundleURLName: io.talise.app
+            CFBundleURLSchemes:
+              - talise
+              - com.googleusercontent.apps.786432206940-rnvri4af4ek2btleebt43i8ovc4h2lod
+        NSCameraUsageDescription: "Talise uses the camera to scan payment QR codes."
+        NSFaceIDUsageDescription: "Confirm sends and signatures with Face ID."
+        ITSAppUsesNonExemptEncryption: false
+        # Allow http://localhost API calls in dev (TALISE_API_BASE_URL).
+        # Prod build sets NSAllowsArbitraryLoads:false; for now the
+        # localhost exception unblocks the simulator dev flow.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+          NSExceptionDomains:
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+        TaliseGoogleClientID: "786432206940-rnvri4af4ek2btleebt43i8ovc4h2lod.apps.googleusercontent.com"
+        # Production backend — separated from the public web hostname so
+        # iOS traffic stays on its own subdomain. For local dev, override
+        # at the scheme level via the TALISE_API_BASE_URL environment
+        # variable (see AppConfig.swift).
+        TaliseAPIBaseURL: "https://app.talise.io"
+    entitlements:
+      path: Talise/Resources/Talise.entitlements
+      properties:
+        com.apple.developer.applesignin:
+          - Default
+        com.apple.developer.devicecheck.appattest-environment: production
+        com.apple.developer.associated-domains:
+          - applinks:talise.io
+          - applinks:www.talise.io
+          - applinks:app.talise.io
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)io.talise.app
+        aps-environment: production
+    dependencies:
+      - package: SuiGrpcKit
+        product: SuiGrpcKit
+      # Embed the Notification Service Extension so it ships inside the app.
+      # xcodegen auto-embeds app-extension targets into the host app.
+      - target: TaliseNotificationService
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.talise.app
+        TARGETED_DEVICE_FAMILY: "1"
+        INFOPLIST_KEY_UIRequiresFullScreen: NO
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  # Notification Service Extension — intercepts mutable-content pushes and
+  # attaches the branded mint card (see NotificationService.swift). Lets a
+  # credit notification show Talise's theme in its expanded view, which the
+  # OS-owned banner chrome otherwise can't.
+  TaliseNotificationService:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: TaliseNotificationService
+        excludes:
+          - "**/.DS_Store"
+    info:
+      path: TaliseNotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: Talise Notifications
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.talise.app.NotificationService
+        TARGETED_DEVICE_FAMILY: "1"
+        # The card is fetched over https from app.talise.io — no localhost
+        # exception needed here, so the extension keeps ATS fully on.
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+
+  # Unit test bundle. Hosted by the Talise app target so it can link
+  # against the app's internal types. App deployment target is iOS 18
+  # (sub-plan 5.6), so the test bundle matches.
+  TaliseTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: TaliseTests
+        excludes:
+          - "**/.DS_Store"
+    dependencies:
+      - target: Talise
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.talise.app.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Talise.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Talise"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  Talise:
+    build:
+      targets:
+        Talise: all
+        TaliseTests: [test]
+    run:
+      config: Debug
+      environmentVariables:
+        OS_ACTIVITY_MODE: disable
+        CFNETWORK_DIAGNOSTICS: "0"
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - TaliseTests
