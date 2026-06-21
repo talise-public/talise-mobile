@@ -60,6 +60,9 @@ struct HomeView: View {
     /// again" prompt). nil = hidden.
     @State private var swapToast: String?
     @State private var swapToastIsError = false
+    // Home card carousel: page 0 = account card, page 1 = token bucket.
+    @State private var homeCardPage = 0
+    @State private var tokenBucketVisible = false
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -82,8 +85,7 @@ struct HomeView: View {
                 // non-USDsui coin (USDC, DEEP, etc.), the activity row now
                 // shows the explicit swap affordance instead of relying on the
                 // dormant auto-swap cron.
-                usernameCard
-                    .padding(.horizontal, 32)
+                homeCardCarousel
                     .padding(.top, 24)
                 // Recent activity, back on the home surface (2026-06-04) per
                 // the design refs. Top 4 rows; "View all" opens the full
@@ -220,6 +222,18 @@ struct HomeView: View {
         .frame(height: 38)
         .fullScreenCover(isPresented: $scanToPaySheetVisible) {
             ScanToPayView()
+        }
+        .fullScreenCover(isPresented: $tokenBucketVisible) {
+            TokenBucketView(
+                coins: walletSweepLegs,
+                symbolFor: { walletSweepLegSymbol($0) },
+                onSwap: { coin in await swapSingleCoin(coin) },
+                onSend: {
+                    tokenBucketVisible = false
+                    NotificationCenter.default.post(name: .taliseRequestSendCover, object: nil)
+                },
+                onDone: { tokenBucketVisible = false }
+            )
         }
     }
 
@@ -505,6 +519,83 @@ struct HomeView: View {
             .padding(.horizontal, 32)
             .frame(height: 212)
         }
+    }
+
+    /// Swipeable home cards: the account card (page 0) and the token
+    /// bucket (page 1). Slide horizontally; tap the bucket to view tokens
+    /// besides USDsui, with per-coin Send and Swap-to-USDsui.
+    private var homeCardCarousel: some View {
+        VStack(spacing: 12) {
+            TabView(selection: $homeCardPage) {
+                usernameCard
+                    .padding(.horizontal, 32)
+                    .tag(0)
+                tokenBucketCard
+                    .padding(.horizontal, 32)
+                    .tag(1)
+            }
+            .frame(height: 212)
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            HStack(spacing: 7) {
+                ForEach(0..<2, id: \.self) { i in
+                    Circle()
+                        .fill(i == homeCardPage ? TaliseColor.fg : TaliseColor.fgDim.opacity(0.45))
+                        .frame(width: 6, height: 6)
+                }
+            }
+        }
+    }
+
+    /// Number of non-USDsui tokens the user holds (above dust).
+    private var tokenBucketSubtitle: String {
+        let n = walletSweepLegs.count
+        if n == 0 { return "No other tokens yet" }
+        return "\(n) token\(n == 1 ? "" : "s") besides USDsui"
+    }
+
+    /// The second home card. Same flat surface as the account card; tap to
+    /// open the token bucket.
+    private var tokenBucketCard: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .frame(height: 212)
+                .flatCard(cornerRadius: 25)
+            Image(systemName: "circle.hexagongrid.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(TaliseColor.greenMint.opacity(0.9))
+                .padding(.top, 22)
+                .padding(.trailing, 24)
+                .frame(maxWidth: .infinity, alignment: .topTrailing)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Token bucket")
+                    .font(TaliseFont.heading(20, weight: .medium))
+                    .kerning(-0.8)
+                    .foregroundStyle(TaliseColor.fgSubtle)
+                    .padding(.top, 27)
+                Text(tokenBucketSubtitle)
+                    .font(TaliseFont.body(13))
+                    .foregroundStyle(TaliseColor.fgMuted)
+                    .padding(.top, 7)
+                Spacer(minLength: 0)
+                HStack {
+                    MicroLabel(text: "OTHER TOKENS")
+                        .kerning(-0.32)
+                    Spacer()
+                    HStack(spacing: 5) {
+                        MicroLabel(text: "TAP TO VIEW")
+                            .kerning(-0.32)
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(TaliseColor.fgDim)
+                    }
+                }
+                .padding(.bottom, 22)
+            }
+            .padding(.horizontal, 32)
+            .frame(height: 212)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 25, style: .continuous))
+        .onTapGesture { tokenBucketVisible = true }
     }
 
     /// CTA shown on the username card when the user hasn't minted a
@@ -1260,6 +1351,37 @@ struct HomeView: View {
             session.signOut()
         } catch {
             flashToast(error.localizedDescription, isError: true)
+        }
+    }
+
+    /// Convert a SINGLE coin to USDsui (the token-bucket per-coin swap, the
+    /// successor to the archived auto-swap). Same sweep + sign+sponsor pipeline
+    /// as `executeWalletSweep`, scoped to one coin. Returns true on success so
+    /// the bucket can drop the row.
+    private func swapSingleCoin(_ coin: WalletCoinBalance) async -> Bool {
+        do {
+            let built = try await WalletAPI.sweep(
+                coins: [WalletSweepCoin(coinType: coin.coinType, amount: coin.amount)]
+            )
+            let intent = "Convert \(walletSweepLegSymbol(coin)) to USDsui"
+            let rewards = ZkLoginCoordinator.RewardsMeta(kind: "swap", amountUsd: built.estUsdOut)
+            _ = try await ZkLoginCoordinator.shared.signAndSubmit(
+                transactionKindB64: built.bytesB64,
+                intent: intent,
+                rewards: rewards
+            )
+            flashToast("Converted to USDsui")
+            await loadAll(force: true)
+            return true
+        } catch APIError.status(_, let msg) {
+            flashToast(msg ?? "Couldn't convert right now.", isError: true)
+            return false
+        } catch ZkLoginCoordinator.SessionError.rebindRequired {
+            session.signOut()
+            return false
+        } catch {
+            flashToast(error.localizedDescription, isError: true)
+            return false
         }
     }
 }

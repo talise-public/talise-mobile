@@ -848,12 +848,23 @@ struct WalletCoinBalance: Codable, Hashable {
     let coinType: String
     let amount: String
     let isUsdsui: Bool
+    /// Enrichment from /api/wallet/balances (Cetus + on-chain metadata).
+    /// Optional so older server builds still decode.
+    let symbol: String?
+    let decimals: Int?
+    let logoUrl: String?
+    let usdValue: Double?
 
     /// Raw amount as a Double for ergonomic dust-filtering. Loses
     /// precision past ~2^53 native units, which doesn't matter for the
     /// dust threshold check.
     var amountDouble: Double {
         Double(amount) ?? 0
+    }
+
+    /// Human-readable balance using the on-chain decimals (default 9).
+    var humanAmount: Double {
+        amountDouble / pow(10, Double(decimals ?? 9))
     }
 }
 
