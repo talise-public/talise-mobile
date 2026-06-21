@@ -6,7 +6,7 @@
 
 The native iOS app for Talise: a gasless US dollar account on Sui that sends by name, settles in under a second, and keeps the amount private.
 
-[Live app](https://app.talise.io) · [Frontend](https://github.com/talise-public/talise-frontend) · [Contracts](https://github.com/talise-public/talise-contracts) · [Docs](https://github.com/talise-public/talise-docs)
+[Website](https://talise.io) · [Frontend](https://github.com/talise-public/talise-frontend) · [Contracts](https://github.com/talise-public/talise-contracts) · [Docs](https://github.com/talise-public/talise-docs)
 
 </div>
 
