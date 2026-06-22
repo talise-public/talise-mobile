@@ -10,8 +10,6 @@ struct TokenBucketView: View {
     let symbolFor: (WalletCoinBalance) -> String
     /// Convert one coin to USDsui. Returns true on success.
     let onSwap: (WalletCoinBalance) async -> Bool
-    /// Open the send flow.
-    let onSend: () -> Void
     /// Dismiss the bucket.
     let onDone: () -> Void
 
@@ -19,13 +17,11 @@ struct TokenBucketView: View {
         coins: [WalletCoinBalance],
         symbolFor: @escaping (WalletCoinBalance) -> String,
         onSwap: @escaping (WalletCoinBalance) async -> Bool,
-        onSend: @escaping () -> Void,
         onDone: @escaping () -> Void
     ) {
         self.coinsInput = coins
         self.symbolFor = symbolFor
         self.onSwap = onSwap
-        self.onSend = onSend
         self.onDone = onDone
         _coins = State(initialValue: coins)
     }
@@ -126,12 +122,6 @@ struct TokenBucketView: View {
                 }
             }
             HStack(spacing: 10) {
-                Button { onSend() } label: {
-                    actionLabel("Send", filled: false)
-                }
-                .buttonStyle(LiquidGlassPressStyle())
-                .disabled(busy)
-
                 Button {
                     Task {
                         swappingType = coin.coinType

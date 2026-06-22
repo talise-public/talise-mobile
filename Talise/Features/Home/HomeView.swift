@@ -52,9 +52,6 @@ struct HomeView: View {
     /// the CTA when there is at least one non-USDsui leg above the dust
     /// threshold to convert.
     @State private var walletCoinBalances: [WalletCoinBalance] = []
-    @State private var walletSweepAlertVisible = false
-    @State private var walletSweepAlertMessage = ""
-    @State private var walletSweeping = false
     /// Transient bottom toast for swap results — replaces re-presenting the
     /// confirm sheet after a swap completes (which read as a wrong "convert
     /// again" prompt). nil = hidden.
@@ -119,16 +116,6 @@ struct HomeView: View {
                 title: "Convert to USDsui",
                 message: sweepAlertMessage,
                 onConfirm: { Task { await executeSweep() } }
-            )
-            .presentationDetents([.height(440)])
-            .presentationDragIndicator(.visible)
-            .presentationBackground(TaliseColor.bg)
-        }
-        .sheet(isPresented: $walletSweepAlertVisible) {
-            SwapToUsdsuiSheet(
-                title: "Convert all to USDsui",
-                message: walletSweepAlertMessage,
-                onConfirm: { Task { await executeWalletSweep() } }
             )
             .presentationDetents([.height(440)])
             .presentationDragIndicator(.visible)
@@ -228,10 +215,6 @@ struct HomeView: View {
                 coins: walletSweepLegs,
                 symbolFor: { walletSweepLegSymbol($0) },
                 onSwap: { coin in await swapSingleCoin(coin) },
-                onSend: {
-                    tokenBucketVisible = false
-                    NotificationCenter.default.post(name: .taliseRequestSendCover, object: nil)
-                },
                 onDone: { tokenBucketVisible = false }
             )
         }
@@ -365,17 +348,9 @@ struct HomeView: View {
             }
             Spacer()
             HStack(spacing: 8) {
-                // "Convert all to USDsui" — one-tap sweep of every non-
-                // USDsui coin in the plain wallet through Cetus. Only
-                // painted when we have at least one swappable leg above
-                // dust; otherwise it's hidden so the row doesn't show a
-                // button that would no-op on tap.
-                if walletSweepEligible {
-                    actionButton(systemName: "arrow.left.arrow.right") {
-                        walletSweepAlertMessage = walletSweepConfirmationMessage()
-                        walletSweepAlertVisible = true
-                    }
-                }
+                // Converting non-USDsui coins now lives entirely in the Token
+                // Bucket (the home card's "Swap to USDsui" per-coin action), so
+                // the old "convert all" button no longer sits in this row.
                 // Deposit (+) — the primary "add money" affordance. Given
                 // a subtle mint tint so the entry point into the redesigned
                 // Deposit flow reads as the hero action in the row without
@@ -1267,10 +1242,6 @@ struct HomeView: View {
             .sorted(by: { $0.coinType < $1.coinType })
     }
 
-    private var walletSweepEligible: Bool {
-        !walletSweepLegs.isEmpty && !walletSweeping
-    }
-
     /// Short symbol shown in the confirmation alert — we don't have a
     /// metadata service wired into Home yet, so we derive a best-effort
     /// label from the type tag's final `::Name` segment (e.g. `SUI`,
@@ -1282,16 +1253,6 @@ struct HomeView: View {
             return last.uppercased()
         }
         return String(b.coinType.suffix(6))
-    }
-
-    private func walletSweepConfirmationMessage() -> String {
-        let legs = walletSweepLegs
-        if legs.isEmpty {
-            return "Nothing eligible to convert right now."
-        }
-        let pretty = legs.prefix(4).map(walletSweepLegSymbol).joined(separator: " + ")
-        let more = legs.count > 4 ? " (+\(legs.count - 4) more)" : ""
-        return "Will convert: \(pretty)\(more) → USDsui via Cetus. Onara pays the gas."
     }
 
     private func loadWalletCoinBalances() async {
@@ -1307,57 +1268,10 @@ struct HomeView: View {
         }
     }
 
-    private func executeWalletSweep() async {
-        let legs = walletSweepLegs
-        guard !legs.isEmpty else { return }
-        walletSweeping = true
-        defer { walletSweeping = false }
-
-        do {
-            // 1. Build the sweep payload from the legs we already
-            //    enumerated — server is the final arbiter on validity
-            //    (Cetus route existence, etc.), but pre-filtering here
-            //    keeps the request small.
-            let coins = legs.map {
-                WalletSweepCoin(coinType: $0.coinType, amount: $0.amount)
-            }
-            let built = try await WalletAPI.sweep(coins: coins)
-
-            // 2. Same sign+sponsor pipeline as every other PTB. Onara
-            //    wraps these transaction-kind bytes into sponsored
-            //    TransactionData, the ephemeral key signs the intent,
-            //    /api/zk/sponsor-execute broadcasts.
-            let intent = "Convert wallet to USDsui (\(legs.count) coin\(legs.count == 1 ? "" : "s"))"
-            // Credit the 1 pt/$1 swap reward on the USDsui actually produced
-            // (server-quoted, net of the 1% fee). 0 estimate → no points,
-            // but the conversion still settles.
-            let rewards = ZkLoginCoordinator.RewardsMeta(
-                kind: "swap",
-                amountUsd: built.estUsdOut
-            )
-            let result = try await ZkLoginCoordinator.shared.signAndSubmit(
-                transactionKindB64: built.bytesB64,
-                intent: intent,
-                rewards: rewards
-            )
-            _ = result
-            // Success → a transient toast, NOT a re-presented confirm sheet.
-            flashToast("Converted to USDsui")
-            await loadAll(force: true)
-        } catch APIError.status(_, let msg) {
-            flashToast(msg ?? "Couldn't convert right now.", isError: true)
-        } catch ZkLoginCoordinator.SessionError.rebindRequired {
-            // Unrecoverable session — clean re-auth (mirrors Send).
-            session.signOut()
-        } catch {
-            flashToast(error.localizedDescription, isError: true)
-        }
-    }
-
     /// Convert a SINGLE coin to USDsui (the token-bucket per-coin swap, the
-    /// successor to the archived auto-swap). Same sweep + sign+sponsor pipeline
-    /// as `executeWalletSweep`, scoped to one coin. Returns true on success so
-    /// the bucket can drop the row.
+    /// successor to the archived auto-swap). Builds a one-coin sweep and runs
+    /// the standard sign+sponsor pipeline. Returns true on success so the
+    /// bucket can drop the row.
     private func swapSingleCoin(_ coin: WalletCoinBalance) async -> Bool {
         do {
             let built = try await WalletAPI.sweep(
