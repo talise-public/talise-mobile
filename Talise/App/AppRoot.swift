@@ -247,10 +247,11 @@ struct MainTabView: View {
                 NotificationCenter.default.post(name: .taliseHomeShouldRefresh, object: nil)
             }
         }
-        // Sign out ONLY when the session ACTUALLY expires — a dead bearer on a
-        // read (401) or a rebind-required on signing posts .taliseSessionExpired.
-        // No inactivity/background timer: backgrounding the app never logs the
-        // user out; they stay signed in until the session genuinely lapses.
+        // Safety net for a session that lapses mid-use: a dead bearer on a read
+        // (401) or a proof failure on signing posts .taliseSessionExpired, and
+        // we sign out cleanly. (The primary freshness policy lives in
+        // AppSession: a fresh sign-in on every cold start + a 60s background
+        // timeout, so the zkLogin proof is always recently minted.)
         .onReceive(NotificationCenter.default.publisher(for: .taliseSessionExpired)) { _ in
             if case .ready = session.phase { session.signOut() }
         }

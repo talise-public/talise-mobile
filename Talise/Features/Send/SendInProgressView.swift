@@ -9,6 +9,11 @@ import SwiftUI
 /// notification fires on success so HomeView can still pick it up.
 struct SendInProgressView: View {
     @Bindable var draft: SendDraft
+    /// Live stage text for the private-send flow (e.g. "Sealing your transfer…",
+    /// "Confirm on your device…"). When nil (a normal send) the screen keeps its
+    /// generic copy. Driven by `ShieldProverController.status`, so it animates
+    /// through the real prover stages instead of a frozen "Sending".
+    var progress: String? = nil
     var onDone: () -> Void
 
     var body: some View {
@@ -20,16 +25,30 @@ struct SendInProgressView: View {
                     .padding(.bottom, 8)
 
                 VStack(spacing: 8) {
-                    Text("Sending…")
+                    Text(progress == nil ? "Sending…" : "Sending privately…")
                         .font(TaliseFont.heading(28, weight: .medium))
                         .kerning(-0.5)
                         .foregroundStyle(TaliseColor.fg)
-                    Text("Should take a moment. You can close this now — we'll keep going.")
-                        .font(TaliseFont.body(14, weight: .light))
-                        .foregroundStyle(TaliseColor.fgMuted)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 32)
+                    // Private sends surface their live stage so the longer ZK
+                    // wait reads as real progress, not a frozen "Sending". The
+                    // `.id` + animation cross-fades each stage as it changes.
+                    if let stage = progress, !stage.isEmpty {
+                        Text(stage)
+                            .font(TaliseFont.body(14, weight: .light))
+                            .foregroundStyle(TaliseColor.fgMuted)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+                            .id(stage)
+                            .transition(.opacity)
+                    } else {
+                        Text("Should take a moment. You can close this now — we'll keep going.")
+                            .font(TaliseFont.body(14, weight: .light))
+                            .foregroundStyle(TaliseColor.fgMuted)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+                    }
                 }
+                .animation(.easeInOut(duration: 0.3), value: progress)
 
                 ShimmerBars()
 

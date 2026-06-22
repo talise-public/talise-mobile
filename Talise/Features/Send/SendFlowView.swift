@@ -203,6 +203,16 @@ struct SendFlowView: View {
             // rather than push so the back-stack doesn't let the user
             // wander back into a stale "Sending…" screen.
             path = [.recipient, .review, .complete]
+
+            // Round-up & Save is now a SEPARATE sponsored tx — the send PTB no
+            // longer bundles the NAVI supply (that combined PTB timed out). Fire
+            // it best-effort after the send lands, on the same clean
+            // /api/earn/supply path the Invest screen uses. A failure here never
+            // touches the already-completed send.
+            if result.roundupUsd > 0 {
+                let saved = result.roundupUsd
+                Task { await fireRoundupSave(saved) }
+            }
         } catch ZkLoginCoordinator.SessionError.rebindRequired {
             // Bearer predates the Poseidon-nonce binding; sign the user
             // out so they re-auth and rebuild a valid session. This is
@@ -224,6 +234,28 @@ struct SendFlowView: View {
             // on Home.
             draft.errorMessage = error.localizedDescription
             path = [.recipient, .review, .failure]
+        }
+    }
+
+    /// Round-up & Save as its OWN sponsored NAVI supply, fired after the send
+    /// completes (the send PTB no longer bundles it). Best-effort — a failure
+    /// here never affects the already-landed send. This is the same clean
+    /// `/api/earn/supply` → sign → sponsor-execute path the Invest screen uses,
+    /// so it credits the round-up save once, where the money actually moves.
+    private func fireRoundupSave(_ usd: Double) async {
+        struct Body: Encodable { let venue: String; let amount: Double }
+        do {
+            let built: BuildKindResponse = try await APIClient.shared.post(
+                "/api/earn/supply/prepare", body: Body(venue: "navi", amount: usd)
+            )
+            _ = try await ZkLoginCoordinator.shared.signAndSubmit(
+                transactionKindB64: built.transactionKindB64,
+                intent: "Round-up & Save",
+                rewards: ZkLoginCoordinator.RewardsMeta(kind: "roundup", amountUsd: usd, venue: "navi")
+            )
+            NotificationCenter.default.post(name: .taliseHomeShouldRefresh, object: nil)
+        } catch {
+            // Best-effort: the send already succeeded. Nothing to surface.
         }
     }
 

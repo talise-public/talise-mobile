@@ -87,9 +87,19 @@ struct TaliseApp: App {
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     switch newPhase {
-                    case .background, .inactive:
+                    case .background:
+                        // Fully left the app — arm the 60s session timer and
+                        // show the privacy lock.
+                        locked = true
+                        session.appDidEnterBackground()
+                    case .inactive:
+                        // Transient (app switcher, notification pull) — lock the
+                        // screen but don't arm the timer.
                         locked = true
                     case .active:
+                        // Returned — drop the session if it sat backgrounded past
+                        // the grace window (→ fresh sign-in + fresh proof).
+                        session.appWillEnterForeground()
                         locked = false
                     @unknown default:
                         break

@@ -1109,10 +1109,14 @@ private struct BankWithdrawView: View {
         }
     }
 
-    /// Poll the Linq order until it completes or fails (or we time out and
-    /// leave it "processing" — the payout still completes server-side).
+    /// Poll the Linq order until it completes or fails. We wait a GENEROUS
+    /// window (~3 min): bank payouts can lag a couple of minutes, so we hold to
+    /// CONFIRM success (green "Paid out") rather than giving up early. The
+    /// server maps a transient "timeout" to still-processing, so only a real
+    /// failed/reject ends this red; otherwise we finish on the reassuring
+    /// "On its way" (the payout completes server-side and shows in activity).
     private func pollStatus(_ id: String) async {
-        for _ in 0..<20 {
+        for i in 0..<45 {
             do {
                 let s: LinqStatusResp = try await APIClient.shared.get("/api/offramp/linq/status/\(id)")
                 switch s.phase {
@@ -1133,9 +1137,12 @@ private struct BankWithdrawView: View {
             } catch {
                 if APIError.isCancellation(error) { return }
             }
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            // Poll a little quicker early (catch fast completions), then ease
+            // off to stay well under the status route's 60/min rate limit.
+            try? await Task.sleep(nanoseconds: UInt64(i < 10 ? 3 : 5) * 1_000_000_000)
         }
-        // Timed out waiting — payout is in flight; let the user move on.
+        // Still in flight after the window — NOT a failure. Reassuring
+        // "On its way" (green clock); paidOut stays false.
         finalStatus = "completed"
         paidOut = false
         statusText = "Your transfer is on its way. It can take a few minutes to land in the bank account."
@@ -1385,7 +1392,10 @@ struct PrivateSendFlowView: View {
                         onBack: { pop() }
                     )
                 case .sending:
-                    SendInProgressView(draft: draft, onDone: { close() })
+                    // Surface the prover's live stage (Sealing your transfer…,
+                    // Confirm on your device…, …). `prover` is observed, so each
+                    // progress message re-renders this screen with the new stage.
+                    SendInProgressView(draft: draft, progress: prover.status, onDone: { close() })
                         .navigationBarBackButtonHidden(true)
                 case .complete:
                     SendCompleteView(draft: draft, onDone: { close() })
@@ -1409,6 +1419,18 @@ struct PrivateSendFlowView: View {
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
         )
+        // Pre-warm the two slow prerequisites WHILE the user is still typing the
+        // amount / picking a recipient, so confirm() is fast:
+        //  • the zkLogin proof — so the deposit-sign leg sends a `cachedProof`
+        //    and the server SKIPS re-proving (a cold proof costs several seconds);
+        //  • the shield note master — so confirm() reads it from the Keychain
+        //    instead of blocking on the escrow round-trip on first use.
+        // Both run concurrently with the prover web layer loading above.
+        .task {
+            async let warm: Void = ZkLoginCoordinator.shared.ensureProofWarm()
+            async let seed: String = ShieldKeyStore.noteMasterHex()
+            _ = await (warm, seed)
+        }
     }
 
     /// One-tap recovery: sweep all unspent shielded notes back to the user's own
@@ -1487,6 +1509,29 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
     @Published var status: String = ""
     private var continuation: CheckedContinuation<String, Error>?
 
+    // ── Timing instrumentation ────────────────────────────────────────────
+    // Parity with the gasless/sponsored `[ios/send] … total=Nms` log: prints,
+    // to the Xcode console, exactly how long a private tx takes and WHERE the
+    // time goes — web prover ready, each in-page stage (Δ between progress
+    // messages), the native deposit-sign leg, and the total. All times are
+    // wall-clock ms via the monotonic CFAbsoluteTime clock.
+    private let tInit = CFAbsoluteTimeGetCurrent()
+    private var tStart: CFAbsoluteTime = 0   // start of the current op
+    private var tPrev: CFAbsoluteTime = 0    // previous stage boundary (for Δ)
+    private var signMs = 0                   // native deposit-sign leg
+    private var opLabel = ""
+
+    private func ms(_ from: CFAbsoluteTime) -> Int {
+        Int(((CFAbsoluteTimeGetCurrent() - from) * 1000.0).rounded())
+    }
+    private func beginTiming(_ label: String) {
+        opLabel = label
+        tStart = CFAbsoluteTimeGetCurrent()
+        tPrev = tStart
+        signMs = 0
+        print("[ios/private] start op=\(label)")
+    }
+
     enum ShieldError: LocalizedError {
         case message(String)
         var errorDescription: String? { if case .message(let m) = self { return m }; return nil }
@@ -1517,6 +1562,7 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
     func send(micros: UInt64, recipient: String, seedHex: String, recipientShieldJson: String? = nil) async throws -> String {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             self.continuation = cont
+            self.beginTiming("send")
             let safeRecipient = recipient.replacingOccurrences(of: "'", with: "")
             let safeSeed = seedHex.replacingOccurrences(of: "'", with: "")
             // JSON-encode the shield identity safely for JS injection (it contains
@@ -1555,6 +1601,7 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
     func recover(seedHex: String, destination: String) async throws -> String {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             self.continuation = cont
+            self.beginTiming("recover")
             let safeSeed = seedHex.replacingOccurrences(of: "'", with: "")
             let safeDest = destination.replacingOccurrences(of: "'", with: "")
             let js = "if(!window.taliseShieldRecover){throw new Error('Recovery isn’t ready yet — try again.')}; window.taliseShieldRecover('\(safeSeed)','\(safeDest)')"
@@ -1577,6 +1624,7 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
     func shieldedBalanceMicros(seedHex: String) async throws -> UInt64 {
         let raw = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             self.continuation = cont
+            self.beginTiming("balance")
             let safeSeed = seedHex.replacingOccurrences(of: "'", with: "")
             let js = "if(!window.taliseShieldBalance){throw new Error('not ready')}; window.taliseShieldBalance('\(safeSeed)')"
             webView.evaluateJavaScript(js) { _, err in
@@ -1595,6 +1643,13 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
         switch body["type"] as? String {
         case "progress":
             status = body["message"] as? String ?? ""
+            // Each in-page stage (key derivation, prove deposit, index, prove
+            // withdraw, relay) posts a progress message — timestamp it so the
+            // console shows the Δ between stages and where the time actually goes.
+            if tStart > 0 {
+                print("[ios/private] +\(ms(tStart))ms (Δ\(ms(tPrev))ms) — \(status)")
+                tPrev = CFAbsoluteTimeGetCurrent()
+            }
         case "result":
             finish(.success(body["digest"] as? String ?? ""))
         case "error":
@@ -1610,11 +1665,15 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
                 return
             }
             Task { @MainActor in
+                let tSign = CFAbsoluteTimeGetCurrent()
                 do {
                     let sub = try await ZkLoginCoordinator.shared.executeSponsorReady(
                         bytesB64: bytesB64, intent: "Private send")
+                    self.signMs = self.ms(tSign)
+                    print("[ios/private] native-sign(deposit)=\(self.signMs)ms digest=\(sub.digest.prefix(10))…")
                     depositSigned(digest: sub.digest, error: "")
                 } catch {
+                    print("[ios/private] native-sign(deposit) FAILED after \(self.ms(tSign))ms — \(error.localizedDescription)")
                     depositSigned(digest: "", error: error.localizedDescription)
                 }
             }
@@ -1640,8 +1699,30 @@ final class ShieldProverController: NSObject, ObservableObject, WKScriptMessageH
     }
 
     private func finish(_ result: Result<String, Error>) {
+        if tStart > 0 {
+            switch result {
+            case .success(let digest):
+                print("[ios/private] DONE op=\(opLabel) total=\(ms(tStart))ms native-sign=\(signMs)ms digest=\(digest.prefix(10))…")
+            case .failure(let err):
+                print("[ios/private] FAILED op=\(opLabel) after=\(ms(tStart))ms — \(err.localizedDescription)")
+            }
+            tStart = 0
+        }
         continuation?.resume(with: result)
         continuation = nil
+    }
+
+    // Navigation logging — surfaces the otherwise-silent web-prover load time
+    // and any load failure (the usual cause of a private send that "hangs" to
+    // the 300s watchdog because the harness never installed).
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        print("[ios/private] prover-web-ready=\(ms(tInit))ms")
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        print("[ios/private] prover-web LOAD FAILED after \(ms(tInit))ms — \(error.localizedDescription)")
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        print("[ios/private] prover-web PROVISIONAL LOAD FAILED after \(ms(tInit))ms — \(error.localizedDescription)")
     }
 }
 
@@ -1977,7 +2058,6 @@ struct ShieldedBalanceView: View {
     @Environment(AppSession.self) private var session
     @StateObject private var prover = ShieldProverController()
     @State private var shieldedMicros: UInt64 = 0
-    @State private var loading = true
     @State private var busy = false
     @State private var status: String?
     @State private var showSend = false
@@ -1988,7 +2068,7 @@ struct ShieldedBalanceView: View {
         VStack(spacing: 24) {
             header
             Spacer(minLength: 8)
-            balanceCard
+            explainer
             Spacer(minLength: 4)
             actions
             if let s = status {
@@ -2025,20 +2105,47 @@ struct ShieldedBalanceView: View {
         .padding(.horizontal, 20).padding(.top, 12)
     }
 
-    private var balanceCard: some View {
-        VStack(spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                HugeIcon(name: "hi.lock", size: 18, tint: TaliseColor.greenMint)
-                Text(loading ? "—" : shieldedDisplay)
-                    .font(TaliseFont.display(56, weight: .medium)).foregroundStyle(TaliseColor.fg)
+    // A plain-language explainer of what a private send is — the screen leads
+    // with this, not a $0.00 balance (which read as "you have nothing"). The
+    // shielded balance only surfaces, quietly, when there is one to recover.
+    private var explainer: some View {
+        VStack(spacing: 24) {
+            ZStack {
+                Circle().fill(TaliseColor.greenMint.opacity(0.14)).frame(width: 86, height: 86)
+                HugeIcon(name: "hi.lock", size: 34, tint: TaliseColor.greenMint)
             }
-            Text(shieldedMicros == 0
-                 ? "Send money so only you and the recipient know the amount."
-                 : "Your private balance · hidden on-chain")
-                .font(TaliseFont.body(13)).foregroundStyle(TaliseColor.fgMuted)
-                .multilineTextAlignment(.center).padding(.horizontal, 36)
+            VStack(spacing: 8) {
+                Text("Private sends")
+                    .font(TaliseFont.heading(26, weight: .medium)).kerning(-0.4)
+                    .foregroundStyle(TaliseColor.fg)
+                Text("Send dollars so only you and the person you pay ever know the amount.")
+                    .font(TaliseFont.body(14, weight: .light)).foregroundStyle(TaliseColor.fgMuted)
+                    .multilineTextAlignment(.center).padding(.horizontal, 34)
+            }
+            VStack(alignment: .leading, spacing: 15) {
+                point("The amount is hidden on-chain.")
+                point("Sender and recipient stay unlinked.")
+                point("Real zero-knowledge, live on Sui.")
+            }
+            .padding(.horizontal, 34)
+            if shieldedMicros > 0 {
+                Text("You have \(shieldedDisplay) shielded.")
+                    .font(TaliseFont.body(12, weight: .light)).foregroundStyle(TaliseColor.fgMuted)
+            }
         }
-        .padding(.vertical, 20)
+        .padding(.vertical, 8)
+    }
+
+    private func point(_ text: String) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(TaliseColor.greenMint.opacity(0.16)).frame(width: 26, height: 26)
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11, weight: .bold)).foregroundStyle(TaliseColor.greenMint)
+            }
+            Text(text).font(TaliseFont.body(15)).foregroundStyle(TaliseColor.fg)
+            Spacer(minLength: 0)
+        }
     }
 
     private var actions: some View {
@@ -2054,6 +2161,10 @@ struct ShieldedBalanceView: View {
                 .buttonStyle(TilePress())
                 .disabled(busy)
             }
+            Text("Up to $10 per send during the pilot.")
+                .font(TaliseFont.mono(10, weight: .regular)).tracking(1.2)
+                .foregroundStyle(TaliseColor.fgDim)
+                .padding(.top, 4)
         }
         .padding(.horizontal, 24)
     }
@@ -2067,10 +2178,8 @@ struct ShieldedBalanceView: View {
     }
 
     private func load() async {
-        loading = true
         let seed = await ShieldKeyStore.noteMasterHex()
         shieldedMicros = (try? await prover.shieldedBalanceMicros(seedHex: seed)) ?? 0
-        loading = false
     }
 
     private func unshield() async {

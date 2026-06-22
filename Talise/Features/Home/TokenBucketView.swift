@@ -36,14 +36,17 @@ struct TokenBucketView: View {
                 emptyState
             } else {
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: 12) {
-                        ForEach(coins, id: \.coinType) { coin in
-                            coinCard(coin)
+                    VStack(spacing: 16) {
+                        totalHero
+                        VStack(spacing: 12) {
+                            ForEach(coins, id: \.coinType) { coin in
+                                coinRow(coin)
+                            }
                         }
                         Color.clear.frame(height: 24)
                     }
                     .padding(.horizontal, 20)
-                    .padding(.top, 8)
+                    .padding(.top, 4)
                 }
             }
         }
@@ -98,72 +101,80 @@ struct TokenBucketView: View {
         }
     }
 
-    // MARK: - Coin card
+    // MARK: - Total value hero
 
-    private func coinCard(_ coin: WalletCoinBalance) -> some View {
-        let symbol = coin.symbol ?? symbolFor(coin)
-        let busy = swappingType == coin.coinType
-        return VStack(spacing: 16) {
-            HStack(spacing: 13) {
-                coinIcon(coin, symbol: symbol)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(symbol)
-                        .font(TaliseFont.heading(17, weight: .medium))
-                        .foregroundStyle(TaliseColor.fg)
-                    Text("\(amountText(coin)) \(symbol)")
-                        .font(TaliseFont.body(13))
-                        .foregroundStyle(TaliseColor.fgMuted)
-                }
-                Spacer()
-                if let usd = coin.usdValue, usd > 0 {
-                    Text(usdText(usd))
-                        .font(TaliseFont.heading(16, weight: .medium))
-                        .foregroundStyle(TaliseColor.fg)
-                }
-            }
-            HStack(spacing: 10) {
-                Button {
-                    Task {
-                        swappingType = coin.coinType
-                        let ok = await onSwap(coin)
-                        swappingType = nil
-                        if ok {
-                            withAnimation { coins.removeAll { $0.coinType == coin.coinType } }
-                        }
-                    }
-                } label: {
-                    if busy {
-                        HStack(spacing: 7) {
-                            ProgressView().tint(TaliseColor.bg)
-                            Text("Swapping…")
-                        }
-                        .font(TaliseFont.body(15, weight: .semibold))
-                        .foregroundStyle(TaliseColor.bg)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 13)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(TaliseColor.greenMint))
-                    } else {
-                        actionLabel("Swap to USDsui", filled: true)
-                    }
-                }
-                .buttonStyle(LiquidGlassPressStyle())
-                .disabled(busy)
-            }
-        }
-        .padding(16)
-        .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(TaliseColor.surface))
+    /// Sum of every coin's USD value (coins with no trustworthy price count 0).
+    private var totalValue: Double {
+        coins.reduce(0) { $0 + ($1.usdValue ?? 0) }
     }
 
-    private func actionLabel(_ t: String, filled: Bool) -> some View {
-        Text(t)
-            .font(TaliseFont.body(15, weight: .semibold))
-            .foregroundStyle(filled ? TaliseColor.bg : TaliseColor.fg)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 13)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(filled ? TaliseColor.greenMint : TaliseColor.fg.opacity(0.08))
-            )
+    private var totalHero: some View {
+        VStack(spacing: 6) {
+            Text(usdText(totalValue))
+                .font(TaliseFont.display(52, weight: .medium)).kerning(-1)
+                .foregroundStyle(TaliseColor.fg)
+            Text("Total bucket value (USDsui)")
+                .font(TaliseFont.mono(11, weight: .regular)).tracking(1.0)
+                .foregroundStyle(TaliseColor.fgMuted)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+    }
+
+    // MARK: - Coin row
+
+    private func coinRow(_ coin: WalletCoinBalance) -> some View {
+        let symbol = coin.symbol ?? symbolFor(coin)
+        let busy = swappingType == coin.coinType
+        return HStack(spacing: 13) {
+            coinIcon(coin, symbol: symbol)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(symbol)
+                    .font(TaliseFont.heading(18, weight: .semibold))
+                    .foregroundStyle(TaliseColor.fg)
+                Text("\(amountText(coin)) \(symbol)")
+                    .font(TaliseFont.body(13))
+                    .foregroundStyle(TaliseColor.fgMuted)
+            }
+            Spacer(minLength: 8)
+            swapPill(coin, busy: busy)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 14)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(TaliseColor.surface))
+    }
+
+    /// Compact, right-aligned Swap-to-USDsui pill (one tap per coin).
+    private func swapPill(_ coin: WalletCoinBalance, busy: Bool) -> some View {
+        Button {
+            Task {
+                swappingType = coin.coinType
+                let ok = await onSwap(coin)
+                swappingType = nil
+                if ok {
+                    withAnimation { coins.removeAll { $0.coinType == coin.coinType } }
+                }
+            }
+        } label: {
+            Group {
+                if busy {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini).tint(TaliseColor.bg)
+                        Text("Swapping…")
+                    }
+                } else {
+                    Text("Swap to USDsui")
+                }
+            }
+            .font(TaliseFont.body(13, weight: .semibold))
+            .foregroundStyle(TaliseColor.bg)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(Capsule().fill(TaliseColor.greenMint))
+        }
+        .buttonStyle(LiquidGlassPressStyle())
+        .disabled(busy)
     }
 
     // MARK: - Formatting

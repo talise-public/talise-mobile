@@ -711,10 +711,12 @@ final class ZkLoginCoordinator {
                 "amountUsd": r.amountUsd,
             ]
             if let v = r.venue { metaDict["venue"] = v }
-            // Prefer the server's value (recomputed from the user's
-            // current round-up config) over whatever the caller passed.
-            let roundup = serverRoundupUsd > 0 ? serverRoundupUsd : (r.roundupUsd ?? 0)
-            if roundup > 0 { metaDict["roundupUsd"] = roundup }
+            // Round-up & Save is DECOUPLED: the send PTB no longer performs the
+            // NAVI supply, so the send must NOT credit a round-up save here. The
+            // client fires a SEPARATE sponsored /api/earn/supply tx for the
+            // round-up, which credits roundup_save once at the place the money
+            // actually moves. `serverRoundupUsd` is still returned below so the
+            // client knows how much to save.
             executeBody["meta"] = metaDict
         }
         // Forward a CACHED proof if available + well-shaped. Skipping
@@ -1201,10 +1203,15 @@ final class ZkLoginCoordinator {
     /// route into the session-rebind path (clean sign-out + "sign in again")
     /// instead of surfacing a cryptic crypto error the user can't act on.
     private func mapExecuteError(_ err: String) -> Error {
-        let l = err.lowercased()
+        // The error can arrive PERCENT-ENCODED (e.g. relayed through a URL), so
+        // "invalid%20user%20signature" must be decoded or the spaced needles
+        // below never match and the raw cryptic string leaks to the user — which
+        // is exactly what happened with "ZKLogin expired at epoch …".
+        let l = (err.removingPercentEncoding ?? err).lowercased()
         let proofFailure =
             l.contains("groth16") || l.contains("proof verify failed")
             || l.contains("invalid user signature") || l.contains("signature is not valid")
+            || l.contains("zklogin expired") || l.contains("expired at epoch")
         if proofFailure {
             ProofCache.shared.clear()
             Task { @MainActor in

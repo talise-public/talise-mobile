@@ -27,115 +27,60 @@ final class AppSession {
         }
     }
 
+    /// Seconds the app may sit in the background before the session is dropped.
+    /// Deliberately short: a new sign-in re-mints the zkLogin proof with a fresh
+    /// `maxEpoch`, so the proof can never be used past its window ("ZKLogin
+    /// expired at epoch …"). 60s, matching the product requirement.
+    private let backgroundGraceSeconds: TimeInterval = 60
+    private var backgroundedAt: Date?
+
     func bootstrap() async {
-        guard SecureSessionStore.shared.hasToken() else {
-            phase = .signedOut
-            return
-        }
+        // SESSION-FRESHNESS POLICY (2026-06-22): every COLD START requires a
+        // fresh sign-in. We deliberately do NOT restore a persisted session.
+        // A new sign-in re-mints the zkLogin proof (new JWT nonce → new
+        // maxEpoch), so a send can never fail with "ZKLogin expired at epoch …"
+        // from a proof left over across an app quit. Clear anything a previous
+        // run persisted and land on the sign-in screen.
+        clearSession()
+        phase = .signedOut
+    }
 
-        // --- Provisional ready (perceived-performance fast path) ---
-        // If we have a cached UserDTO from a prior session, flip the
-        // phase to .ready IMMEDIATELY so HomeView mounts with no network
-        // wait. We then revalidate /api/me in the background and update
-        // currentUser + the cache on success.
-        //
-        // We don't know the userId before we have the user object, so we
-        // fall back to scanning UserDefaults by trying the stored bearer
-        // identity. In practice we seed the userId from the last
-        // successful /api/me response, stored keyed by "last_user_id".
-        if let lastId = UserDefaults.standard.string(forKey: "io.talise.snapshot.lastUserId"),
-           let cached = LocalSnapshotStore.loadUser(userId: lastId) {
-            if cached.accountType == nil {
-                phase = .onboarding(user: cached)
-            } else {
-                phase = .ready(user: cached)
-                Task { await ZkLoginCoordinator.shared.ensureProofWarm() }
-                Task { await CurrencySettings.shared.refresh() }
-            }
-            // Background revalidation — update the user object without
-            // blocking the UI. Only sign out on a definitive 401; any
-            // transport or timeout error keeps the cached session alive.
-            let cachedUserId = lastId
-            Task {
-                do {
-                    let me: UserDTO = try await APIClient.shared.get("/api/me")
-                    LocalSnapshotStore.saveUser(me)
-                    UserDefaults.standard.set(
-                        me.id,
-                        forKey: "io.talise.snapshot.lastUserId"
-                    )
-                    // Update the phase only if the account state changed
-                    // (e.g. onboarding completed on another device).
-                    if me.accountType == nil {
-                        phase = .onboarding(user: me)
-                    } else {
-                        phase = .ready(user: me)
-                    }
-                } catch APIError.unauthorized {
-                    // Definitive auth failure — clear everything and
-                    // send the user to the sign-in screen.
-                    LocalSnapshotStore.clear(userId: cachedUserId)
-                    UserDefaults.standard.removeObject(
-                        forKey: "io.talise.snapshot.lastUserId"
-                    )
-                    SecureSessionStore.shared.clear()
-                    EphemeralKeyStore.shared.wipe()
-                    ProofCache.shared.clear()
-                    phase = .signedOut
-                } catch {
-                    // Transport / timeout — keep the cached session;
-                    // the user stays on the home screen with stale data.
-                    // The next pull-to-refresh will revalidate naturally.
-                }
-            }
-            return
-        }
+    /// Called when the app is fully backgrounded (the user left it). Arms the
+    /// inactivity timer only when there's a live session to drop.
+    func appDidEnterBackground() {
+        backgroundedAt = (currentUser == nil) ? nil : Date()
+    }
 
-        // --- First sign-in path (no cached user) — current behavior ---
-        do {
-            let me: UserDTO = try await APIClient.shared.get("/api/me")
-            LocalSnapshotStore.saveUser(me)
-            UserDefaults.standard.set(
-                me.id,
-                forKey: "io.talise.snapshot.lastUserId"
-            )
-            if me.accountType == nil {
-                phase = .onboarding(user: me)
-            } else {
-                phase = .ready(user: me)
-                // Returning users — their bearer survived but the
-                // ProofCache might be cold (esp. if it predates the
-                // Keychain persistence). Warm it in the background so
-                // the first Send doesn't fail with "no proof cache".
-                Task { await ZkLoginCoordinator.shared.ensureProofWarm() }
-                // FX rates for the display-currency picker. Soft-fails
-                // to USD-only if /api/fx is unreachable.
-                Task { await CurrencySettings.shared.refresh() }
-            }
-        } catch APIError.unauthorized {
-            SecureSessionStore.shared.clear()
-            phase = .signedOut
-        } catch {
-            // No /me yet (404) or transient network issue — fall back to
-            // signed-out rather than wedging launch. User can re-auth.
-            SecureSessionStore.shared.clear()
-            phase = .signedOut
+    /// Called when the app returns to the foreground. If it sat in the
+    /// background past the grace window, drop the session so the user signs in
+    /// again (and gets a fresh proof). Quick app-switches stay signed in.
+    func appWillEnterForeground() {
+        guard let since = backgroundedAt else { return }
+        backgroundedAt = nil
+        if currentUser != nil,
+           Date().timeIntervalSince(since) >= backgroundGraceSeconds {
+            signOut()
         }
     }
 
     func signOut() {
-        // Clear the snapshot cache for the departing user before wiping
-        // the session so we still know who we're clearing.
+        clearSession()
+        phase = .signedOut
+    }
+
+    /// Wipe every persisted credential: cached user snapshot, bearer, ephemeral
+    /// key, and zkLogin proof. The shield note master is intentionally left
+    /// alone — it lives in the iCloud Keychain + server escrow and is restored
+    /// on the next sign-in, so a signed-out user never loses private funds.
+    private func clearSession() {
         if let uid = currentUser?.id {
             LocalSnapshotStore.clear(userId: uid)
-            UserDefaults.standard.removeObject(
-                forKey: "io.talise.snapshot.lastUserId"
-            )
         }
+        UserDefaults.standard.removeObject(forKey: "io.talise.snapshot.lastUserId")
         SecureSessionStore.shared.clear()
         EphemeralKeyStore.shared.wipe()
         ProofCache.shared.clear()
-        phase = .signedOut
+        backgroundedAt = nil
     }
 
     /// Called by SignInView after ZkLoginCoordinator.signIn() returns.
